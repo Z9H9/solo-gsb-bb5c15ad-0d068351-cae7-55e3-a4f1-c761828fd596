@@ -941,15 +941,32 @@ def resume_share(token: str, payload: ShareResume):
 
     The resume token is bound to one specific share snapshot and one run; it
     can only be consumed while opening that very share link (path token must
-    match ``resume_tokens.share_token``). The token is single-use: its ``used``
-    flag flips to 1 atomically with the lookup (a conditional UPDATE), so a
-    repeated or concurrent reuse is rejected. Finished sessions cannot be
-    resumed either; start a new answer instead.
+    match ``resume_tokens.share_token``). The token is single-use.
+
+    The snapshot check, token ownership validation, the unfinished-session
+    check, the token claim and the returned session read all run in ONE
+    ``BEGIN IMMEDIATE`` write transaction. SQLite's write lock serializes this
+    against a choice, undo or restart on the same run, so the question, path
+    and revision handed back are always the committed-latest state:
+
+      * a resume racing the choice that finishes the interview is rejected
+        with 400 instead of returning the pre-finish question (the next
+        answer would otherwise 409 against the bumped revision);
+      * a resume racing an undo/restart loses to that transaction, which
+        voids the outstanding token (used = 1) inside its own write lock,
+        so the resume sees an already-used token and is rejected;
+      * two concurrent resumes with the same token serialize on the claim,
+        only one succeeds.
+
+    Every rejection raises before commit and rolls the (still uncommitted)
+    claim back, so a failed resume never consumes the token.
     """
     resume_token = (payload.resume_token or "").strip()
     if not resume_token:
         raise HTTPException(400, "请输入续答令牌")
-    with get_db() as db:
+    db = get_db()
+    try:
+        _begin_run_write(db)
         share = db.execute("SELECT 1 FROM shares WHERE token = ?", (token,)).fetchone()
         if share is None:
             raise HTTPException(404, "分享链接不存在或已失效")
@@ -967,15 +984,31 @@ def resume_share(token: str, payload: ShareResume):
         if row is None:
             raise HTTPException(404, "原作答会话已不存在，无法恢复")
         if row["finished"]:
+            # Read under the write lock: no choice finishing the interview can
+            # commit between this check and the claim, so a resume can never
+            # return the end node's stale question/path/revision.
             raise HTTPException(400, "该访谈已结束，无法续答；请开始新的作答")
-        # Atomic single-use claim: only succeeds while used is still 0.
+        # Atomic single-use claim inside the SAME transaction, re-checked on
+        # used and on the owning snapshot (same pattern as invite codes). With
+        # the write lock held this is the serialized commit point: undo and
+        # restart void outstanding tokens in their own write transactions, and
+        # concurrent resumes queue behind this one — a loser that raced before
+        # the lock sees used = 1 via the guard above; rowcount 0 is the
+        # last-line defense, and any such failure rolls the claim back.
         claimed = db.execute(
-            "UPDATE resume_tokens SET used = 1 WHERE token = ? AND used = 0",
-            (resume_token,),
+            "UPDATE resume_tokens SET used = 1 WHERE token = ? AND share_token = ? AND used = 0",
+            (resume_token, token),
         ).rowcount
         if not claimed:
             raise HTTPException(400, "续答令牌已使用，一次性令牌无法再次恢复；请开始新的作答")
-        return _run_response(db, row)
+        response = _run_response(db, row)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    return response
 
 
 # ---- runtime preview ------------------------------------------------------
