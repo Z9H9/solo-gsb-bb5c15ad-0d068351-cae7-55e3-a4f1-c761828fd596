@@ -945,11 +945,22 @@ def resume_share(token: str, payload: ShareResume):
     flag flips to 1 atomically with the lookup (a conditional UPDATE), so a
     repeated or concurrent reuse is rejected. Finished sessions cannot be
     resumed either; start a new answer instead.
+
+    The share check, the token ownership/used checks, the unfinished-session
+    check, the token claim and the returned session state all run in ONE
+    ``BEGIN IMMEDIATE`` write transaction: the run row is read with the write
+    lock held, so it IS the latest committed state and cannot change while the
+    response is built — a choice, undo or restart committing just before the
+    resume is already reflected here (never a stale question/path/revision),
+    and a racing one serializes after. Any rejection raises before the claim
+    write and the rollback leaves the token unused.
     """
     resume_token = (payload.resume_token or "").strip()
     if not resume_token:
         raise HTTPException(400, "请输入续答令牌")
-    with get_db() as db:
+    db = get_db()
+    try:
+        _begin_run_write(db)
         share = db.execute("SELECT 1 FROM shares WHERE token = ?", (token,)).fetchone()
         if share is None:
             raise HTTPException(404, "分享链接不存在或已失效")
@@ -968,14 +979,23 @@ def resume_share(token: str, payload: ShareResume):
             raise HTTPException(404, "原作答会话已不存在，无法恢复")
         if row["finished"]:
             raise HTTPException(400, "该访谈已结束，无法续答；请开始新的作答")
-        # Atomic single-use claim: only succeeds while used is still 0.
+        # Atomic single-use claim inside the same write transaction: only
+        # succeeds while used is still 0, and commits together with the
+        # locked read above — a concurrent resume sees used = 1.
         claimed = db.execute(
             "UPDATE resume_tokens SET used = 1 WHERE token = ? AND used = 0",
             (resume_token,),
         ).rowcount
         if not claimed:
             raise HTTPException(400, "续答令牌已使用，一次性令牌无法再次恢复；请开始新的作答")
-        return _run_response(db, row)
+        response = _run_response(db, row)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    return response
 
 
 # ---- runtime preview ------------------------------------------------------
